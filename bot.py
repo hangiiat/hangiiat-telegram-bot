@@ -78,7 +78,8 @@ def resolve_media(url, is_story):
     if not medias:
         raise Exception("MEDIA_NOT_FOUND")
 
-    return medias
+    # کل پاسخ API برگردانده می‌شود تا کپشن هم در دسترس باشد
+    return data
 
 
 def fetch_media(media, folder, index):
@@ -137,6 +138,25 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+def split_text(text, limit=4000):
+    """تقسیم متن بلند به پیام‌های مجاز تلگرام"""
+    parts = []
+
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+
+        if cut <= 0:
+            cut = limit
+
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+
+    if text:
+        parts.append(text)
+
+    return parts
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
@@ -151,6 +171,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     is_post = re.match(post_pattern, url, re.IGNORECASE)
+
     is_story = re.match(story_pattern, url, re.IGNORECASE)
 
     is_reel = re.match(
@@ -178,9 +199,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         with tempfile.TemporaryDirectory() as folder:
-            medias = await asyncio.to_thread(
+
+            api_data = await asyncio.to_thread(
                 resolve_media, url, bool(is_story)
             )
+
+            medias = api_data.get("medias", [])
 
             sent = 0
             failed = 0
@@ -248,6 +272,27 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if sent == 0:
                 raise Exception("No media could be sent")
+
+            # ارسال کپشن و هشتگ فقط برای ریلز
+            if is_reel:
+                meta = api_data.get("meta") or {}
+
+                caption_text = (
+                    meta.get("text")
+                    or meta.get("title")
+                    or ""
+                ).strip()
+
+                if caption_text:
+                    try:
+                        for part in split_text(caption_text):
+                            await update.message.reply_text(part)
+
+                    except Exception:
+                        logging.exception("Caption sending failed")
+                        await update.message.reply_text(
+                            "⚠️ ویدئو دانلود شد، اما ارسال کپشن با مشکل مواجه شد."
+                        )
 
             await msg.delete()
 
