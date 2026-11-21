@@ -5,10 +5,12 @@ import asyncio
 import tempfile
 import threading
 import logging
+import hashlib
 from pathlib import Path
 
 import requests
 from flask import Flask
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -90,6 +92,7 @@ def fetch_media(media, folder, index):
         stream=True,
         timeout=(15, 60)
     )
+
     response.raise_for_status()
 
     content_length = int(response.headers.get("Content-Length", 0))
@@ -124,6 +127,16 @@ def fetch_media(media, folder, index):
     return path
 
 
+def file_hash(path):
+    digest = hashlib.sha256()
+
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
@@ -139,6 +152,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_post = re.match(post_pattern, url, re.IGNORECASE)
     is_story = re.match(story_pattern, url, re.IGNORECASE)
+
+    is_reel = re.match(
+        r"^https?://(?:www\.)?instagram\.com/reel/",
+        url,
+        re.IGNORECASE
+    )
 
     if not is_post and not is_story:
         await update.message.reply_text(
@@ -159,28 +178,47 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         with tempfile.TemporaryDirectory() as folder:
-
             medias = await asyncio.to_thread(
                 resolve_media, url, bool(is_story)
             )
 
             sent = 0
             failed = 0
+            seen_hashes = set()
+            single_media_sent = False
 
             for index, media in enumerate(medias[:10]):
+
+                media_type = str(media.get("type", "")).lower()
+
+                # برای ریلز فقط ویدئو ارسال شود، نه تصویر کاور
+                if is_reel and media_type != "video":
+                    continue
+
+                # استوری و ریلز فقط یک فایل ارسال کنند
+                if (is_story or is_reel) and single_media_sent:
+                    break
+
                 try:
                     path = await asyncio.to_thread(
                         fetch_media, media, folder, index
                     )
 
-                    with path.open("rb") as file:
-                        media_type = str(
-                            media.get("type", "")
-                        ).lower()
+                    # شناسایی فایل‌های کاملاً تکراری
+                    digest = await asyncio.to_thread(file_hash, path)
 
+                    if digest in seen_hashes:
+                        continue
+
+                    seen_hashes.add(digest)
+
+                    with path.open("rb") as file:
                         ext = path.suffix.lower()
 
-                        if media_type == "image" and path.stat().st_size <= 10 * 1024 * 1024:
+                        if (
+                            media_type == "image"
+                            and path.stat().st_size <= 10 * 1024 * 1024
+                        ):
                             await update.message.reply_photo(
                                 photo=file,
                                 caption="دانلود با HANGIIAT ❤️"
@@ -200,6 +238,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     sent += 1
 
+                    if is_story or is_reel:
+                        single_media_sent = True
+                        break
+
                 except Exception:
                     failed += 1
                     logging.exception("One media failed")
@@ -209,7 +251,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await msg.delete()
 
-            if len(medias) > 10:
+            if len(medias) > 10 and not (is_story or is_reel):
                 await update.message.reply_text(
                     "⚠️ فقط ۱۰ فایل اول ارسال شد."
                 )
@@ -226,12 +268,19 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if "PRIVATE_CONTENT" in error_text:
             reply = "❌ این پیج خصوصی است و قابل دانلود نیست."
+
         elif "MEDIA_NOT_FOUND" in error_text:
             reply = "❌ استوری فعال یا محتوای قابل دانلود پیدا نشد."
-        elif "INVALID_API_KEY" in error_text or "MISSING_API_KEY" in error_text:
+
+        elif (
+            "INVALID_API_KEY" in error_text
+            or "MISSING_API_KEY" in error_text
+        ):
             reply = "❌ کلید SaveAPI معتبر نیست. تنظیمات سرور را بررسی کن."
+
         elif "QUOTA_EXCEEDED" in error_text:
             reply = "❌ اعتبار رایگان SaveAPI تمام شده است."
+
         else:
             reply = "❌ دریافت محتوا ممکن نشد. کمی بعد دوباره امتحان کن."
 
