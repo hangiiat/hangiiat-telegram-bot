@@ -3,9 +3,10 @@ import os
 import re
 import asyncio
 import tempfile
+import threading
 from pathlib import Path
 
-import yt_dlp
+from flask import Flask
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,12 +15,20 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import yt_dlp
 
 TOKEN = os.environ["BOT_TOKEN"]
 
+web = Flask(__name__)
+
+@web.get("/")
+def home():
+    return "HANGIIAT Bot is running!"
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام! 👋 به ربات HANGIIAT Downloader خوش اومدی.\n\n"
+        "سلام! 👋\n"
+        "به HANGIIAT Downloader خوش اومدی.\n"
         "لینک پست یا ریلز عمومی اینستاگرام رو بفرست."
     )
 
@@ -46,11 +55,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url
     ):
         await update.message.reply_text(
-            "لطفاً لینک معتبر یک پست یا ریلز عمومی اینستاگرام بفرست."
+            "لطفاً لینک معتبر یک پست یا ریلز عمومی بفرست."
         )
         return
 
-    message = await update.message.reply_text("⏳ در حال بررسی لینک...")
+    msg = await update.message.reply_text("⏳ در حال بررسی لینک...")
 
     try:
         with tempfile.TemporaryDirectory() as folder:
@@ -60,7 +69,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise Exception("فایل پیدا نشد")
 
             if path.stat().st_size > 45 * 1024 * 1024:
-                raise Exception("حجم فایل بیشتر از حد مجاز است")
+                raise Exception("حجم فایل زیاد است")
 
             with path.open("rb") as video:
                 await update.message.reply_video(
@@ -68,11 +77,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption="دانلود با HANGIIAT ❤️"
                 )
 
-        await message.delete()
+        await msg.delete()
 
     except Exception:
-        await message.edit_text(
-            "❌ دریافت این ویدئو ممکن نشد.\n"
+        await msg.edit_text(
+            "❌ دریافت این محتوا ممکن نشد. "
             "ممکن است لینک در دسترس نباشد یا محدودیت داشته باشد."
         )
 
@@ -82,6 +91,15 @@ def main():
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)
     )
+
+    threading.Thread(
+        target=lambda: web.run(
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", 10000))
+        ),
+        daemon=True
+    ).start()
+
     app.run_polling()
 
 if __name__ == "__main__":
