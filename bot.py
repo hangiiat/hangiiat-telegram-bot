@@ -33,7 +33,6 @@ logging.basicConfig(
 
 TOKEN = os.environ["BOT_TOKEN"]
 SAVEAPI_KEY = os.environ.get("SAVEAPI_KEY", "").strip()
-
 API_BASE = "https://api.saveapi.org/v1"
 MAX_SIZE = 45 * 1024 * 1024
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
@@ -41,8 +40,7 @@ FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 10) "
-        "AppleWebKit/537.36 Chrome/120.0.0.0 "
-        "Mobile Safari/537.36"
+        "AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
     )
 }
 
@@ -54,31 +52,15 @@ def home():
     return "HANGIIAT Bot is running!"
 
 
+# ---------------- START ----------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام! 👋\n"
-        "به HANGIIAT Downloader خوش اومدی.\n\n"
-        "📸 Instagram\n"
-        "📌 Pinterest\n"
-        "▶️ YouTube\n\n"
-        "دانلود عکس، ویدئو و صدای MP3 ❤️"
+        "سلام 👋 به HANGIIAT Downloader خوش اومدی.\n\n"
+        "📸 دانلود از اینستاگرام\n"
+        "📌 دانلود عکس و ویدئو از پینترست\n\n"
+        "لینک موردنظرت رو بفرست ❤️"
     )
-
-
-def split_text(text, limit=4000):
-    parts = []
-
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut <= 0:
-            cut = limit
-        parts.append(text[:cut].strip())
-        text = text[cut:].strip()
-
-    if text:
-        parts.append(text)
-
-    return parts
 
 
 # ---------------- HTML METADATA ----------------
@@ -120,53 +102,41 @@ def get_page_metadata(url):
     return response.url, parser.data
 
 
-# ---------------- URL HELPERS ----------------
+# ---------------- PINTEREST URL ----------------
 
-def resolve_pinterest_url(url):
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
+def pinterest_host(host):
+    host = (host or "").lower().split(":")[0]
 
     if host == "pin.it":
+        return True
+
+    if host.startswith("www."):
+        host = host[4:]
+
+    return host == "pinterest.com" or host.endswith(
+        (".pinterest.com", ".pinterest.co.uk", ".pinterest.ca")
+    )
+
+
+def is_pinterest_url(url):
+    return pinterest_host(urlparse(url).hostname)
+
+
+def resolve_pinterest_url(url):
+    if (urlparse(url).hostname or "").lower() == "pin.it":
         response = requests.get(
             url,
             headers=HEADERS,
             allow_redirects=True,
-            timeout=25,
+            timeout=30,
         )
         response.raise_for_status()
         url = response.url
 
-    host = (urlparse(url).hostname or "").lower()
-
-    if not (
-        host == "pinterest.com"
-        or host.endswith(".pinterest.com")
-        or re.fullmatch(r"pinterest\.[a-z.]+", host)
-    ):
+    if not is_pinterest_url(url):
         raise Exception("INVALID_PINTEREST_URL")
 
     return url
-
-
-def is_pinterest_url(url):
-    host = (urlparse(url).hostname or "").lower()
-
-    return (
-        host == "pin.it"
-        or host == "pinterest.com"
-        or host.endswith(".pinterest.com")
-        or bool(re.fullmatch(r"pinterest\.[a-z.]+", host))
-    )
-
-
-def is_youtube_url(url):
-    host = (urlparse(url).hostname or "").lower()
-
-    return (
-        host == "youtu.be"
-        or host == "youtube.com"
-        or host.endswith(".youtube.com")
-    )
 
 
 # ---------------- INSTAGRAM ----------------
@@ -188,13 +158,13 @@ def resolve_media(url, is_story):
     try:
         data = response.json()
     except ValueError:
-        raise Exception("Invalid API response")
+        raise Exception("INVALID_API_RESPONSE")
 
     if not response.ok or not data.get("success"):
-        error = data.get("error", {})
-        code = error.get("code", "UNKNOWN")
-        message = error.get("message", "Download failed")
-        raise Exception(f"{code}: {message}")
+        error = data.get("error") or {}
+        raise Exception(
+            error.get("message", "INSTAGRAM_DOWNLOAD_FAILED")
+        )
 
     if not data.get("medias"):
         raise Exception("MEDIA_NOT_FOUND")
@@ -206,7 +176,7 @@ def fetch_media(media, folder, index):
     media_url = media.get("url")
 
     if not media_url:
-        raise Exception("Media URL missing")
+        raise Exception("MEDIA_URL_MISSING")
 
     response = requests.get(
         media_url,
@@ -221,31 +191,35 @@ def fetch_media(media, folder, index):
     )
 
     if content_length > MAX_SIZE:
-        raise Exception("File too large")
+        raise Exception("FILE_TOO_LARGE")
 
     ext = str(media.get("ext") or "").lower()
     ext = re.sub(r"[^a-z0-9]", "", ext)
 
     if not ext:
-        ext = "jpg" if media.get("type") == "image" else "mp4"
+        ext = (
+            "jpg"
+            if media.get("type") == "image"
+            else "mp4"
+        )
 
     path = Path(folder) / f"media_{index}.{ext}"
     total = 0
 
     with path.open("wb") as file:
-        for chunk in response.iter_content(chunk_size=64 * 1024):
+        for chunk in response.iter_content(65536):
             if not chunk:
                 continue
 
             total += len(chunk)
 
             if total > MAX_SIZE:
-                raise Exception("File too large")
+                raise Exception("FILE_TOO_LARGE")
 
             file.write(chunk)
 
     if total == 0:
-        raise Exception("Empty file")
+        raise Exception("EMPTY_FILE")
 
     return path
 
@@ -254,40 +228,59 @@ def file_hash(path):
     digest = hashlib.sha256()
 
     with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+        for chunk in iter(
+            lambda: file.read(1024 * 1024),
+            b"",
+        ):
             digest.update(chunk)
 
     return digest.hexdigest()
 
 
-async def handle_instagram(update, url, is_story, is_reel, msg):
+async def handle_instagram(
+    update,
+    url,
+    is_story,
+    is_reel,
+    msg,
+):
     with tempfile.TemporaryDirectory() as folder:
-        api_data = await asyncio.to_thread(
-            resolve_media, url, is_story
+        data = await asyncio.to_thread(
+            resolve_media,
+            url,
+            is_story,
         )
 
-        medias = api_data.get("medias", [])
+        medias = data.get("medias", [])
         sent = 0
         failed = 0
-        seen_hashes = set()
+        seen = set()
 
         for index, media in enumerate(medias[:10]):
-            media_type = str(media.get("type", "")).lower()
+            media_type = str(
+                media.get("type", "")
+            ).lower()
 
             if is_reel and media_type != "video":
                 continue
 
             try:
                 path = await asyncio.to_thread(
-                    fetch_media, media, folder, index
+                    fetch_media,
+                    media,
+                    folder,
+                    index,
                 )
 
-                digest = await asyncio.to_thread(file_hash, path)
+                digest = await asyncio.to_thread(
+                    file_hash,
+                    path,
+                )
 
-                if digest in seen_hashes:
+                if digest in seen:
                     continue
 
-                seen_hashes.add(digest)
+                seen.add(digest)
 
                 with path.open("rb") as file:
                     ext = path.suffix.lower()
@@ -323,62 +316,193 @@ async def handle_instagram(update, url, is_story, is_reel, msg):
                 logging.exception("Instagram media failed")
 
         if sent == 0:
-            raise Exception("No media could be sent")
+            raise Exception("NO_INSTAGRAM_MEDIA_SENT")
 
-        if is_reel:
-            meta = api_data.get("meta") or {}
-            caption_text = (
-                meta.get("text") or meta.get("title") or ""
-            ).strip()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
-            if caption_text:
-                for part in split_text(caption_text):
-                    await update.message.reply_text(part)
-
-        await msg.delete()
+        if failed:
+            await update.message.reply_text(
+                f"⚠️ دریافت {failed} فایل ناموفق بود."
+            )
 
         if len(medias) > 10 and not (is_story or is_reel):
             await update.message.reply_text(
                 "⚠️ فقط ۱۰ فایل اول ارسال شد."
             )
 
-        if failed:
-            await update.message.reply_text(
-                f"⚠️ {failed} فایل قابل ارسال نبود."
-            )
+        if is_reel:
+            meta = data.get("meta") or {}
+            caption = (
+                meta.get("text")
+                or meta.get("title")
+                or ""
+            ).strip()
+
+            if caption:
+                for part in split_text(caption):
+                    await update.message.reply_text(part)
 
 
-# ---------------- YOUTUBE OPTIONS ----------------
+def split_text(text, limit=4000):
+    parts = []
+
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+
+        if cut <= 0:
+            cut = limit
+
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+
+    if text:
+        parts.append(text)
+
+    return parts
+
+
+# ---------------- PINTEREST EXTRACTION ----------------
 
 def yt_options():
     return {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 30,
+        "socket_timeout": 35,
         "retries": 3,
-        "fragment_retries": 3,
-        "extractor_retries": 2,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
         "ffmpeg_location": FFMPEG_PATH,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv"]
-            }
-        },
+        "http_headers": HEADERS,
     }
 
 
-# ---------------- PINTEREST IMAGE ----------------
+def get_height(item):
+    height = item.get("height")
 
-def pinterest_image_info(url):
-    final_url = resolve_pinterest_url(url)
+    if height:
+        try:
+            return int(height)
+        except (TypeError, ValueError):
+            pass
 
-    page_url, meta = get_page_metadata(final_url)
+    format_id = str(item.get("format_id") or "")
+    match = re.search(
+        r"(?<!\d)(\d{3,4})p?(?!\d)",
+        format_id,
+        re.I,
+    )
+
+    return int(match.group(1)) if match else 0
+
+
+def extract_pinterest_formats(url):
+    url = resolve_pinterest_url(url)
+    extractor_error = None
+
+    # ابتدا استخراج مستقیم با yt-dlp
+    try:
+        with yt_dlp.YoutubeDL(yt_options()) as ydl:
+            info = ydl.extract_info(
+                url,
+                download=False,
+            )
+
+        formats = info.get("formats") or []
+        choices = {}
+
+        for item in formats:
+            format_id = item.get("format_id")
+
+            if not format_id:
+                continue
+
+            if item.get("vcodec") == "none":
+                continue
+
+            height = get_height(item)
+            label = (
+                f"{height}p"
+                if height
+                else "کیفیت اصلی"
+            )
+
+            size = (
+                item.get("filesize")
+                or item.get("filesize_approx")
+                or 0
+            )
+
+            if size and size > MAX_SIZE:
+                continue
+
+            candidate = {
+                "format": str(format_id),
+                "label": label,
+                "height": height,
+                "is_image": False,
+                "size": size,
+            }
+
+            old = choices.get(label)
+
+            if old is None:
+                choices[label] = candidate
+            elif int(size or 0) > int(old.get("size") or 0):
+                choices[label] = candidate
+
+        if choices:
+            result = sorted(
+                choices.values(),
+                key=lambda x: x["height"],
+                reverse=True,
+            )
+
+            return (
+                info.get("title") or "Pinterest",
+                result,
+                url,
+            )
+
+        direct_url = info.get("url")
+        direct_ext = str(
+            info.get("ext") or ""
+        ).lower()
+
+        if direct_url and direct_ext in (
+            "mp4",
+            "webm",
+            "m4v",
+        ):
+            return (
+                info.get("title") or "Pinterest",
+                [{
+                    "format": "direct:" + direct_url,
+                    "label": "ویدئوی اصلی",
+                    "height": 0,
+                    "is_image": False,
+                }],
+                url,
+            )
+
+    except Exception as error:
+        extractor_error = error
+        logging.warning(
+            "Pinterest yt-dlp failed: %s",
+            error,
+        )
+
+    # بررسی اطلاعات صفحه در صورت شکست استخراج
+    page_url, meta = get_page_metadata(url)
 
     video_url = (
         meta.get("og:video:secure_url")
         or meta.get("og:video")
         or meta.get("twitter:player:stream")
+        or meta.get("twitter:player:stream:content")
     )
 
     image_url = (
@@ -393,182 +517,63 @@ def pinterest_image_info(url):
         or "Pinterest"
     )
 
-    return page_url, title, video_url, image_url
+    og_type = (
+        meta.get("og:type") or ""
+    ).lower()
 
+    video_signal = bool(video_url) or "video" in og_type
 
-# ---------------- FORMAT EXTRACTION ----------------
+    if video_url:
+        video_path = urlparse(video_url).path.lower()
 
-def extract_formats(url, platform):
-    if platform == "pinterest":
-        final_url, title, video_url, image_url = (
-            pinterest_image_info(url)
-        )
+        if video_path.endswith(
+            (".mp4", ".m4v", ".webm")
+        ):
+            return (
+                title,
+                [{
+                    "format": "direct:" + video_url,
+                    "label": "ویدئوی اصلی",
+                    "height": 0,
+                    "is_image": False,
+                }],
+                page_url,
+            )
 
-        if video_url:
-            try:
-                options = yt_options()
-
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    info = ydl.extract_info(
-                        final_url,
-                        download=False,
-                    )
-
-                formats = info.get("formats") or []
-                choices = {}
-
-                for item in formats:
-                    format_id = item.get("format_id")
-                    ext = str(item.get("ext") or "").lower()
-                    height = int(item.get("height") or 0)
-                    vcodec = item.get("vcodec")
-
-                    if (
-                        not format_id
-                        or ext not in ("mp4", "webm", "m4v")
-                        or vcodec in (None, "none")
-                    ):
-                        continue
-
-                    size = (
-                        item.get("filesize")
-                        or item.get("filesize_approx")
-                        or 0
-                    )
-
-                    if size and size > MAX_SIZE:
-                        continue
-
-                    label = f"{height}p" if height else "کیفیت اصلی"
-
-                    old = choices.get(label)
-
-                    if old is None or size > old.get("size", 0):
-                        choices[label] = {
-                            "format": format_id,
-                            "label": label,
-                            "height": height,
-                            "is_image": False,
-                            "size": size,
-                        }
-
-                result = sorted(
-                    choices.values(),
-                    key=lambda x: x["height"],
-                    reverse=True,
-                )
-
-                if result:
-                    return info.get("title", title), result, final_url
-
-            except Exception:
-                logging.exception(
-                    "Pinterest video extraction failed"
-                )
-
-            return title, [{
-                "format": "direct:" + video_url,
-                "label": "کیفیت اصلی ویدئو",
+        return (
+            title,
+            [{
+                "format": "source:" + video_url,
+                "label": "ویدئو - کیفیت اصلی",
                 "height": 0,
                 "is_image": False,
-            }], final_url
+            }],
+            page_url,
+        )
 
-        if image_url:
-            return title, [{
+    if video_signal:
+        raise Exception(
+            "PINTEREST_VIDEO_EXTRACTION_FAILED"
+        ) from extractor_error
+
+    if image_url:
+        return (
+            title,
+            [{
                 "format": "direct:" + image_url,
                 "label": "تصویر اصلی",
                 "height": 0,
                 "is_image": True,
-            }], final_url
-
-        raise Exception("PINTEREST_MEDIA_NOT_FOUND")
-
-    # YouTube
-    options = yt_options()
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    formats = info.get("formats") or []
-    choices = {}
-
-    for item in formats:
-        format_id = item.get("format_id")
-
-        if not format_id:
-            continue
-
-        ext = str(item.get("ext") or "").lower()
-
-        if ext not in ("mp4", "webm", "m4v"):
-            continue
-
-        height = int(item.get("height") or 0)
-        vcodec = item.get("vcodec")
-
-        if vcodec in (None, "none"):
-            continue
-
-        filesize = (
-            item.get("filesize")
-            or item.get("filesize_approx")
-            or 0
+            }],
+            page_url,
         )
 
-        if filesize and filesize > MAX_SIZE:
-            continue
-
-        label = (
-            f"{height}p"
-            if height
-            else "کیفیت اصلی"
-        )
-
-        selector = (
-            f"bestvideo[height<={height}]"
-            f"+bestaudio/"
-            f"best[height<={height}]"
-            if height
-            else "bestvideo+bestaudio/best"
-        )
-
-        old = choices.get(label)
-
-        score = (
-            1 if ext == "mp4" else 0,
-            1 if item.get("acodec") not in (None, "none") else 0,
-            int(filesize or 0),
-        )
-
-        if old is None or score > old["score"]:
-            choices[label] = {
-                "format": selector,
-                "label": label,
-                "height": height,
-                "is_image": False,
-                "score": score,
-            }
-
-    result = sorted(
-        choices.values(),
-        key=lambda x: x["height"],
-        reverse=True,
-    )
-
-    if not result:
-        result = [{
-            "format": "bestvideo+bestaudio/best",
-            "label": "بهترین کیفیت موجود",
-            "height": 0,
-            "is_image": False,
-        }]
-
-    return info.get("title", "YouTube"), result, url
+    raise Exception("PINTEREST_MEDIA_NOT_FOUND")
 
 
-# ---------------- KEYBOARD ----------------
+# ---------------- PINTEREST KEYBOARD ----------------
 
-def build_keyboard(choices, platform):
+def build_keyboard(choices):
     buttons = []
 
     for index, choice in enumerate(choices):
@@ -576,14 +581,6 @@ def build_keyboard(choices, platform):
             InlineKeyboardButton(
                 f"📥 {choice['label']}",
                 callback_data=f"quality:{index}",
-            )
-        )
-
-    if platform == "youtube":
-        buttons.append(
-            InlineKeyboardButton(
-                "🎵 دریافت MP3",
-                callback_data="quality:audio",
             )
         )
 
@@ -595,85 +592,102 @@ def build_keyboard(choices, platform):
     return InlineKeyboardMarkup(rows)
 
 
-async def prepare_external(update, context, url, platform):
+async def prepare_pinterest(update, context, url):
     msg = await update.message.reply_text(
-        "⏳ در حال بررسی لینک و کیفیت‌ها..."
+        "⏳ در حال بررسی لینک پینترست..."
     )
 
     try:
         title, choices, final_url = await asyncio.to_thread(
-            extract_formats, url, platform
+            extract_pinterest_formats,
+            url,
         )
 
         context.user_data["pending_download"] = {
             "url": final_url,
-            "platform": platform,
             "choices": choices,
             "title": title,
         }
 
         await msg.edit_text(
-            f"📥 {platform.upper()}\n\n"
+            f"📌 PINTEREST\n\n"
             f"🎞 {title[:180]}\n\n"
-            "کیفیت مورد نظرت رو انتخاب کن:",
-            reply_markup=build_keyboard(choices, platform),
+            "کیفیت موردنظرت رو انتخاب کن:",
+            reply_markup=build_keyboard(choices),
         )
 
     except Exception as error:
-        logging.exception("Format extraction failed")
+        logging.exception(
+            "Pinterest extraction error"
+        )
 
-        error_text = str(error).lower()
-
-        if "sign in to confirm" in error_text or "not a bot" in error_text:
-            reply = (
-                "❌ یوتیوب دسترسی سرور را محدود کرده است.\n"
-                "این لینک فعلاً بدون کوکی قابل دریافت نیست."
-            )
-        elif platform == "pinterest":
-            reply = (
-                "❌ دریافت محتوای پینترست ممکن نشد.\n"
-                "ممکن است پین خصوصی باشد یا اطلاعات صفحه در دسترس نباشد."
+        if "PINTEREST_VIDEO_EXTRACTION_FAILED" in str(error):
+            text = (
+                "❌ این پین ویدئویی است، اما فایل ویدئو دریافت نشد.\n"
+                "کاور را به‌جای فیلم ارسال نمی‌کنم."
             )
         else:
-            reply = (
-                "❌ دریافت کیفیت‌های ویدئو ممکن نشد.\n"
-                "ممکن است لینک محدود یا نامعتبر باشد."
+            text = (
+                "❌ دریافت محتوای پینترست ممکن نشد.\n"
+                "ممکن است پین خصوصی یا لینک نامعتبر باشد."
             )
 
-        await msg.edit_text(reply)
+        await msg.edit_text(text)
 
 
-# ---------------- DIRECT DOWNLOAD ----------------
+# ---------------- DOWNLOAD ----------------
 
-def download_direct(url, folder):
+def download_direct(url, folder, expected_image=False):
     response = requests.get(
         url,
         headers=HEADERS,
         stream=True,
         timeout=(15, 60),
     )
+
     response.raise_for_status()
 
     content_type = (
         response.headers.get("Content-Type", "")
-        .split(";")[0].lower()
+        .split(";")[0]
+        .lower()
     )
 
-    path_ext = Path(urlparse(url).path).suffix.lower()
+    url_ext = Path(
+        urlparse(url).path
+    ).suffix.lower()
 
-    if path_ext not in (
-        ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".webm"
+    if expected_image and content_type:
+        if not content_type.startswith("image/"):
+            raise Exception("URL_DID_NOT_RETURN_IMAGE")
+
+    if content_type.startswith("image/"):
+        ext = mimetypes.guess_extension(content_type) or ".jpg"
+
+    elif content_type.startswith("video/"):
+        ext = mimetypes.guess_extension(content_type) or ".mp4"
+
+    elif url_ext in (
+        ".jpg", ".jpeg", ".png", ".webp",
+        ".mp4", ".m4v", ".webm",
     ):
-        path_ext = mimetypes.guess_extension(content_type) or ""
+        ext = url_ext
 
-    if not path_ext:
-        path_ext = ".jpg" if content_type.startswith("image/") else ".mp4"
+    else:
+        ext = ".bin"
 
-    path = Path(folder) / ("pinterest_media" + path_ext)
+    path = Path(folder) / ("pinterest_file" + ext)
+
     total = 0
+    content_length = int(
+        response.headers.get("Content-Length", 0)
+    )
+
+    if content_length > MAX_SIZE:
+        raise Exception("FILE_TOO_LARGE")
 
     with path.open("wb") as file:
-        for chunk in response.iter_content(chunk_size=64 * 1024):
+        for chunk in response.iter_content(65536):
             if not chunk:
                 continue
 
@@ -685,22 +699,27 @@ def download_direct(url, folder):
             file.write(chunk)
 
     if total == 0:
-        raise Exception("EMPTY_FILE")
+        raise Exception("EMPTY_DOWNLOAD")
 
     return [path]
 
 
-# ---------------- DOWNLOAD ----------------
-
-def download_external(url, folder, format_selector, audio_only=False):
-    if format_selector.startswith("direct:"):
-        if audio_only:
-            raise Exception("INVALID_AUDIO_SELECTION")
+def download_external(url, folder, selector):
+    if selector.startswith("direct:"):
+        direct_url = selector[len("direct:"):]
 
         return download_direct(
-            format_selector[len("direct:"):],
+            direct_url,
             folder,
         )
+
+    if selector.startswith("source:"):
+        source_url = selector[len("source:"):]
+        target_url = source_url
+        format_value = "best"
+    else:
+        target_url = url
+        format_value = selector
 
     options = yt_options()
 
@@ -711,81 +730,72 @@ def download_external(url, folder, format_selector, audio_only=False):
         "restrictfilenames": True,
         "max_filesize": MAX_SIZE,
         "merge_output_format": "mp4",
+        "format": format_value,
     })
 
-    if audio_only:
-        options.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "128",
-            }],
-        })
-    else:
-        options["format"] = format_selector
-
     with yt_dlp.YoutubeDL(options) as ydl:
-        ydl.extract_info(url, download=True)
+        ydl.extract_info(
+            target_url,
+            download=True,
+        )
 
     files = [
-        p for p in Path(folder).iterdir()
-        if p.is_file()
-        and not p.name.endswith((".part", ".ytdl"))
+        path
+        for path in Path(folder).iterdir()
+        if path.is_file()
+        and not path.name.endswith(
+            (".part", ".ytdl")
+        )
     ]
 
     if not files:
         raise Exception("DOWNLOAD_FAILED")
 
+    for path in files:
+        if path.stat().st_size > MAX_SIZE:
+            raise Exception("FILE_TOO_LARGE")
+
     return sorted(
         files,
-        key=lambda p: p.stat().st_size,
+        key=lambda path: path.stat().st_size,
         reverse=True,
     )
 
 
-# ---------------- CALLBACK ----------------
+# ---------------- QUALITY CALLBACK ----------------
 
-async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def quality_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
 
-    pending = context.user_data.get("pending_download")
+    pending = context.user_data.get(
+        "pending_download"
+    )
 
     if not pending:
         await query.edit_message_text(
-            "❌ درخواست منقضی شده. لطفاً لینک رو دوباره بفرست."
+            "❌ درخواست منقضی شده. لینک را دوباره بفرست."
         )
         return
 
-    selection = query.data.split(":", 1)[1]
+    try:
+        index = int(
+            query.data.split(":", 1)[1]
+        )
 
-    if selection == "audio":
-        if pending["platform"] != "youtube":
-            await query.edit_message_text(
-                "❌ این گزینه پشتیبانی نمی‌شود."
-            )
-            return
+        choice = pending["choices"][index]
 
-        format_selector = "bestaudio/best"
-        audio_only = True
-
-    else:
-        try:
-            index = int(selection)
-            choice = pending["choices"][index]
-            format_selector = choice["format"]
-
-        except (ValueError, IndexError, KeyError):
-            await query.edit_message_text(
-                "❌ انتخاب کیفیت معتبر نیست."
-            )
-            return
-
-        audio_only = False
+    except (ValueError, IndexError, KeyError):
+        await query.edit_message_text(
+            "❌ انتخاب کیفیت معتبر نیست."
+        )
+        return
 
     await query.edit_message_text(
-        "⏳ کیفیت انتخاب شد. در حال دانلود..."
+        "⏳ در حال دانلود فایل..."
     )
 
     try:
@@ -794,13 +804,12 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 download_external,
                 pending["url"],
                 folder,
-                format_selector,
-                audio_only,
+                choice["format"],
             )
 
             sent = 0
 
-            for path in files[:10]:
+            for path in files[:5]:
                 size = path.stat().st_size
 
                 if size == 0 or size > MAX_SIZE:
@@ -809,15 +818,13 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ext = path.suffix.lower()
 
                 with path.open("rb") as file:
-                    if audio_only and ext == ".mp3":
-                        await context.bot.send_audio(
-                            chat_id=query.message.chat_id,
-                            audio=file,
-                            title=path.stem[:64],
-                            caption="دانلود با HANGIIAT ❤️",
-                        )
-
-                    elif ext in (".jpg", ".jpeg", ".png", ".webp"):
+                    if ext in (
+                        ".jpg",
+                        ".jpeg",
+                        ".png",
+                        ".webp",
+                        ".gif",
+                    ):
                         if size <= 10 * 1024 * 1024:
                             await context.bot.send_photo(
                                 chat_id=query.message.chat_id,
@@ -850,79 +857,72 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sent == 0:
                 raise Exception("NO_SENDABLE_FILE")
 
-        context.user_data.pop("pending_download", None)
+        context.user_data.pop(
+            "pending_download",
+            None,
+        )
 
         await query.message.reply_text(
             "✅ دانلود با موفقیت انجام شد."
         )
 
-    except Exception as error:
-        logging.exception("External download failed")
+    except Exception:
+        logging.exception(
+            "Pinterest download failed"
+        )
 
-        error_text = str(error).lower()
-
-        if "sign in to confirm" in error_text or "not a bot" in error_text:
-            reply = (
-                "❌ یوتیوب دسترسی سرور را محدود کرده است.\n"
-                "این لینک فعلاً بدون کوکی قابل دریافت نیست."
-            )
-        elif "no_sendable_file" in error_text:
-            reply = (
-                "❌ فایل قابل ارسال نیست یا حجمش بیش از حد مجازه."
-            )
-        else:
-            reply = (
-                "❌ دانلود انجام نشد.\n"
-                "ممکنه فرمت انتخابی یا لینک محدود باشه."
-            )
-
-        await query.message.reply_text(reply)
+        await query.message.reply_text(
+            "❌ دانلود انجام نشد.\n"
+            "ممکن است پینترست دسترسی سرور را محدود کرده باشد "
+            "یا حجم فایل بیش از حد مجاز باشد."
+        )
 
 
-# ---------------- MAIN HANDLER ----------------
+# ---------------- MAIN LINK HANDLER ----------------
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_link(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     url = update.message.text.strip()
 
     instagram_post = re.match(
         r"^https?://(?:www\.)?instagram\.com/(?:p|reel)/[^/?#]+",
         url,
-        re.IGNORECASE,
+        re.I,
     )
 
     instagram_story = re.match(
         r"^https?://(?:www\.)?instagram\.com/stories/[^/?#]+",
         url,
-        re.IGNORECASE,
+        re.I,
     )
 
     is_reel = re.match(
         r"^https?://(?:www\.)?instagram\.com/reel/",
         url,
-        re.IGNORECASE,
+        re.I,
     )
 
     pinterest = is_pinterest_url(url)
-    youtube = is_youtube_url(url)
 
     if not (
         instagram_post
         or instagram_story
         or pinterest
-        or youtube
     ):
         await update.message.reply_text(
-            "❌ لینک معتبر اینستاگرام، پینترست یا یوتیوب بفرست."
-        )
-        return
-
-    if (instagram_post or instagram_story) and not SAVEAPI_KEY:
-        await update.message.reply_text(
-            "❌ کلید SaveAPI در تنظیمات سرور پیدا نشد."
+            "❌ لینک معتبر اینستاگرام یا پینترست بفرست."
         )
         return
 
     if instagram_post or instagram_story:
+        if not SAVEAPI_KEY:
+            await update.message.reply_text(
+                "❌ کلید SaveAPI در تنظیمات سرور پیدا نشد."
+            )
+            return
+
         msg = await update.message.reply_text(
             "⏳ در حال دریافت محتوای اینستاگرام..."
         )
@@ -936,38 +936,28 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg,
             )
 
-        except Exception as error:
-            logging.exception("Instagram download failed")
-
-            error_text = str(error)
-
-            if "PRIVATE_CONTENT" in error_text:
-                reply = "❌ این پیج خصوصی است."
-            elif "MEDIA_NOT_FOUND" in error_text:
-                reply = "❌ محتوای قابل دانلود پیدا نشد."
-            elif "QUOTA_EXCEEDED" in error_text:
-                reply = "❌ اعتبار SaveAPI تمام شده است."
-            else:
-                reply = "❌ دریافت محتوای اینستاگرام ممکن نشد."
+        except Exception:
+            logging.exception(
+                "Instagram download failed"
+            )
 
             try:
-                await msg.edit_text(reply)
+                await msg.edit_text(
+                    "❌ دریافت محتوای اینستاگرام ممکن نشد."
+                )
             except Exception:
-                await update.message.reply_text(reply)
+                await update.message.reply_text(
+                    "❌ دریافت محتوای اینستاگرام ممکن نشد."
+                )
 
         return
 
     if pinterest:
-        await prepare_external(
-            update, context, url, "pinterest"
+        await prepare_pinterest(
+            update,
+            context,
+            url,
         )
-        return
-
-    if youtube:
-        await prepare_external(
-            update, context, url, "youtube"
-        )
-        return
 
 
 # ---------------- MAIN ----------------
@@ -975,7 +965,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
 
     app.add_handler(
         CallbackQueryHandler(
@@ -999,6 +991,7 @@ def main():
         daemon=True,
     ).start()
 
+    logging.info("HANGIIAT bot started")
     app.run_polling()
 
 
