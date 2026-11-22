@@ -6,8 +6,10 @@ import tempfile
 import threading
 import logging
 import hashlib
+import mimetypes
 from pathlib import Path
 from urllib.parse import urlparse
+from html.parser import HTMLParser
 
 import requests
 import yt_dlp
@@ -39,29 +41,12 @@ FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 10) "
-        "AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"
+        "AppleWebKit/537.36 Chrome/120.0.0.0 "
+        "Mobile Safari/537.36"
     )
 }
 
 web = Flask(__name__)
-
-# کوکی یوتیوب اختیاری؛ فقط از متغیر محیطی HOKAS خوانده می‌شود.
-YOUTUBE_COOKIES_TEXT = os.environ.get(
-    "YOUTUBE_COOKIES_TEXT", ""
-).strip()
-
-YOUTUBE_COOKIES_FILE = None
-
-if YOUTUBE_COOKIES_TEXT:
-    cookie_file = tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".txt",
-        delete=False,
-        encoding="utf-8",
-    )
-    cookie_file.write(YOUTUBE_COOKIES_TEXT)
-    cookie_file.close()
-    YOUTUBE_COOKIES_FILE = cookie_file.name
 
 
 @web.get("/")
@@ -96,12 +81,52 @@ def split_text(text, limit=4000):
     return parts
 
 
+# ---------------- HTML METADATA ----------------
+
+class MetaParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.data = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "meta":
+            return
+
+        attrs = dict(attrs)
+        key = (
+            attrs.get("property")
+            or attrs.get("name")
+            or ""
+        ).lower()
+
+        value = attrs.get("content")
+
+        if key and value:
+            self.data[key] = value
+
+
+def get_page_metadata(url):
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        allow_redirects=True,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    parser = MetaParser()
+    parser.feed(response.text)
+
+    return response.url, parser.data
+
+
 # ---------------- URL HELPERS ----------------
 
 def resolve_pinterest_url(url):
     parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
 
-    if parsed.hostname and parsed.hostname.lower() == "pin.it":
+    if host == "pin.it":
         response = requests.get(
             url,
             headers=HEADERS,
@@ -109,18 +134,16 @@ def resolve_pinterest_url(url):
             timeout=25,
         )
         response.raise_for_status()
-        final_url = response.url
+        url = response.url
 
-        final_host = (urlparse(final_url).hostname or "").lower()
+    host = (urlparse(url).hostname or "").lower()
 
-        if not (
-            final_host == "pinterest.com"
-            or final_host.endswith(".pinterest.com")
-            or re.fullmatch(r"pinterest\.[a-z.]+", final_host)
-        ):
-            raise Exception("PINTEREST_REDIRECT_INVALID")
-
-        return final_url
+    if not (
+        host == "pinterest.com"
+        or host.endswith(".pinterest.com")
+        or re.fullmatch(r"pinterest\.[a-z.]+", host)
+    ):
+        raise Exception("INVALID_PINTEREST_URL")
 
     return url
 
@@ -141,8 +164,8 @@ def is_youtube_url(url):
 
     return (
         host == "youtu.be"
-        or host.endswith(".youtube.com")
         or host == "youtube.com"
+        or host.endswith(".youtube.com")
     )
 
 
@@ -187,6 +210,7 @@ def fetch_media(media, folder, index):
 
     response = requests.get(
         media_url,
+        headers=HEADERS,
         stream=True,
         timeout=(15, 60),
     )
@@ -324,33 +348,142 @@ async def handle_instagram(update, url, is_story, is_reel, msg):
             )
 
 
-# ---------------- YOUTUBE COOKIES ----------------
+# ---------------- YOUTUBE OPTIONS ----------------
 
 def yt_options():
-    options = {
+    return {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 30,
-        "retries": 2,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
         "ffmpeg_location": FFMPEG_PATH,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv"]
+            }
+        },
     }
 
-    if YOUTUBE_COOKIES_FILE:
-        options["cookiefile"] = YOUTUBE_COOKIES_FILE
 
-    return options
+# ---------------- PINTEREST IMAGE ----------------
+
+def pinterest_image_info(url):
+    final_url = resolve_pinterest_url(url)
+
+    page_url, meta = get_page_metadata(final_url)
+
+    video_url = (
+        meta.get("og:video:secure_url")
+        or meta.get("og:video")
+        or meta.get("twitter:player:stream")
+    )
+
+    image_url = (
+        meta.get("og:image")
+        or meta.get("twitter:image")
+        or meta.get("twitter:image:src")
+    )
+
+    title = (
+        meta.get("og:title")
+        or meta.get("twitter:title")
+        or "Pinterest"
+    )
+
+    return page_url, title, video_url, image_url
 
 
 # ---------------- FORMAT EXTRACTION ----------------
 
 def extract_formats(url, platform):
-    url = (
-        resolve_pinterest_url(url)
-        if platform == "pinterest"
-        else url
-    )
+    if platform == "pinterest":
+        final_url, title, video_url, image_url = (
+            pinterest_image_info(url)
+        )
 
+        if video_url:
+            try:
+                options = yt_options()
+
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(
+                        final_url,
+                        download=False,
+                    )
+
+                formats = info.get("formats") or []
+                choices = {}
+
+                for item in formats:
+                    format_id = item.get("format_id")
+                    ext = str(item.get("ext") or "").lower()
+                    height = int(item.get("height") or 0)
+                    vcodec = item.get("vcodec")
+
+                    if (
+                        not format_id
+                        or ext not in ("mp4", "webm", "m4v")
+                        or vcodec in (None, "none")
+                    ):
+                        continue
+
+                    size = (
+                        item.get("filesize")
+                        or item.get("filesize_approx")
+                        or 0
+                    )
+
+                    if size and size > MAX_SIZE:
+                        continue
+
+                    label = f"{height}p" if height else "کیفیت اصلی"
+
+                    old = choices.get(label)
+
+                    if old is None or size > old.get("size", 0):
+                        choices[label] = {
+                            "format": format_id,
+                            "label": label,
+                            "height": height,
+                            "is_image": False,
+                            "size": size,
+                        }
+
+                result = sorted(
+                    choices.values(),
+                    key=lambda x: x["height"],
+                    reverse=True,
+                )
+
+                if result:
+                    return info.get("title", title), result, final_url
+
+            except Exception:
+                logging.exception(
+                    "Pinterest video extraction failed"
+                )
+
+            return title, [{
+                "format": "direct:" + video_url,
+                "label": "کیفیت اصلی ویدئو",
+                "height": 0,
+                "is_image": False,
+            }], final_url
+
+        if image_url:
+            return title, [{
+                "format": "direct:" + image_url,
+                "label": "تصویر اصلی",
+                "height": 0,
+                "is_image": True,
+            }], final_url
+
+        raise Exception("PINTEREST_MEDIA_NOT_FOUND")
+
+    # YouTube
     options = yt_options()
 
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -367,14 +500,14 @@ def extract_formats(url, platform):
 
         ext = str(item.get("ext") or "").lower()
 
-        if ext not in (
-            "mp4", "webm", "m4v",
-            "jpg", "jpeg", "png", "webp"
-        ):
+        if ext not in ("mp4", "webm", "m4v"):
             continue
 
-        height = item.get("height")
+        height = int(item.get("height") or 0)
         vcodec = item.get("vcodec")
+
+        if vcodec in (None, "none"):
+            continue
 
         filesize = (
             item.get("filesize")
@@ -382,34 +515,24 @@ def extract_formats(url, platform):
             or 0
         )
 
-        is_image = ext in ("jpg", "jpeg", "png", "webp")
-        is_video = vcodec not in (None, "none")
-
-        if not is_image and not is_video:
-            continue
-
         if filesize and filesize > MAX_SIZE:
             continue
 
-        quality = int(height or 0)
-
         label = (
-            f"{quality}p"
-            if quality
-            else ("تصویر اصلی" if is_image else "کیفیت اصلی")
+            f"{height}p"
+            if height
+            else "کیفیت اصلی"
         )
 
-        if platform == "youtube" and is_video and quality:
-            # انتخاب کیفیت با ترکیب ویدئو و صدای جداگانه
-            selector = (
-                f"bestvideo[height<={quality}]"
-                f"+bestaudio/"
-                f"best[height<={quality}]"
-            )
-        elif platform == "youtube" and is_video:
-            selector = "bestvideo+bestaudio/best"
-        else:
-            selector = format_id
+        selector = (
+            f"bestvideo[height<={height}]"
+            f"+bestaudio/"
+            f"best[height<={height}]"
+            if height
+            else "bestvideo+bestaudio/best"
+        )
+
+        old = choices.get(label)
 
         score = (
             1 if ext == "mp4" else 0,
@@ -417,14 +540,12 @@ def extract_formats(url, platform):
             int(filesize or 0),
         )
 
-        old = choices.get(label)
-
         if old is None or score > old["score"]:
             choices[label] = {
                 "format": selector,
                 "label": label,
-                "height": quality,
-                "is_image": is_image,
+                "height": height,
+                "is_image": False,
                 "score": score,
             }
 
@@ -440,13 +561,12 @@ def extract_formats(url, platform):
             "label": "بهترین کیفیت موجود",
             "height": 0,
             "is_image": False,
-            "score": (0, 0, 0),
         }]
 
-    return info.get("title", "HANGIIAT"), result, url
+    return info.get("title", "YouTube"), result, url
 
 
-# ---------------- QUALITY KEYBOARD ----------------
+# ---------------- KEYBOARD ----------------
 
 def build_keyboard(choices, platform):
     buttons = []
@@ -454,7 +574,7 @@ def build_keyboard(choices, platform):
     for index, choice in enumerate(choices):
         buttons.append(
             InlineKeyboardButton(
-                f"🎬 {choice['label']}",
+                f"📥 {choice['label']}",
                 callback_data=f"quality:{index}",
             )
         )
@@ -477,7 +597,7 @@ def build_keyboard(choices, platform):
 
 async def prepare_external(update, context, url, platform):
     msg = await update.message.reply_text(
-        "⏳ در حال بررسی کیفیت‌های موجود..."
+        "⏳ در حال بررسی لینک و کیفیت‌ها..."
     )
 
     try:
@@ -492,13 +612,11 @@ async def prepare_external(update, context, url, platform):
             "title": title,
         }
 
-        keyboard = build_keyboard(choices, platform)
-
         await msg.edit_text(
             f"📥 {platform.upper()}\n\n"
             f"🎞 {title[:180]}\n\n"
             "کیفیت مورد نظرت رو انتخاب کن:",
-            reply_markup=keyboard,
+            reply_markup=build_keyboard(choices, platform),
         )
 
     except Exception as error:
@@ -509,42 +627,91 @@ async def prepare_external(update, context, url, platform):
         if "sign in to confirm" in error_text or "not a bot" in error_text:
             reply = (
                 "❌ یوتیوب دسترسی سرور را محدود کرده است.\n"
-                "برای این لینک ممکن است کوکی معتبر لازم باشد."
+                "این لینک فعلاً بدون کوکی قابل دریافت نیست."
             )
         elif platform == "pinterest":
             reply = (
                 "❌ دریافت محتوای پینترست ممکن نشد.\n"
-                "ممکن است پین خصوصی یا لینک نامعتبر باشد."
+                "ممکن است پین خصوصی باشد یا اطلاعات صفحه در دسترس نباشد."
             )
         else:
             reply = (
-                "❌ نتونستم کیفیت‌های این لینک رو دریافت کنم.\n"
-                "لینک ممکنه محدود یا نامعتبر باشه."
+                "❌ دریافت کیفیت‌های ویدئو ممکن نشد.\n"
+                "ممکن است لینک محدود یا نامعتبر باشد."
             )
 
         await msg.edit_text(reply)
 
 
+# ---------------- DIRECT DOWNLOAD ----------------
+
+def download_direct(url, folder):
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        stream=True,
+        timeout=(15, 60),
+    )
+    response.raise_for_status()
+
+    content_type = (
+        response.headers.get("Content-Type", "")
+        .split(";")[0].lower()
+    )
+
+    path_ext = Path(urlparse(url).path).suffix.lower()
+
+    if path_ext not in (
+        ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".webm"
+    ):
+        path_ext = mimetypes.guess_extension(content_type) or ""
+
+    if not path_ext:
+        path_ext = ".jpg" if content_type.startswith("image/") else ".mp4"
+
+    path = Path(folder) / ("pinterest_media" + path_ext)
+    total = 0
+
+    with path.open("wb") as file:
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+
+            total += len(chunk)
+
+            if total > MAX_SIZE:
+                raise Exception("FILE_TOO_LARGE")
+
+            file.write(chunk)
+
+    if total == 0:
+        raise Exception("EMPTY_FILE")
+
+    return [path]
+
+
 # ---------------- DOWNLOAD ----------------
 
 def download_external(url, folder, format_selector, audio_only=False):
-    options = {
+    if format_selector.startswith("direct:"):
+        if audio_only:
+            raise Exception("INVALID_AUDIO_SELECTION")
+
+        return download_direct(
+            format_selector[len("direct:"):],
+            folder,
+        )
+
+    options = yt_options()
+
+    options.update({
         "outtmpl": str(
             Path(folder) / "%(title).60s-%(id)s.%(ext)s"
         ),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
         "restrictfilenames": True,
         "max_filesize": MAX_SIZE,
-        "ffmpeg_location": FFMPEG_PATH,
-        "socket_timeout": 30,
-        "retries": 2,
         "merge_output_format": "mp4",
-    }
-
-    if YOUTUBE_COOKIES_FILE and is_youtube_url(url):
-        options["cookiefile"] = YOUTUBE_COOKIES_FILE
+    })
 
     if audio_only:
         options.update({
@@ -570,7 +737,11 @@ def download_external(url, folder, format_selector, audio_only=False):
     if not files:
         raise Exception("DOWNLOAD_FAILED")
 
-    return sorted(files, key=lambda p: p.stat().st_size, reverse=True)
+    return sorted(
+        files,
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
 
 
 # ---------------- CALLBACK ----------------
@@ -617,13 +788,11 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏳ کیفیت انتخاب شد. در حال دانلود..."
     )
 
-    url = pending["url"]
-
     try:
         with tempfile.TemporaryDirectory() as folder:
             files = await asyncio.to_thread(
                 download_external,
-                url,
+                pending["url"],
                 folder,
                 format_selector,
                 audio_only,
@@ -695,7 +864,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "sign in to confirm" in error_text or "not a bot" in error_text:
             reply = (
                 "❌ یوتیوب دسترسی سرور را محدود کرده است.\n"
-                "برای دانلود این لینک ممکن است کوکی معتبر لازم باشد."
+                "این لینک فعلاً بدون کوکی قابل دریافت نیست."
             )
         elif "no_sendable_file" in error_text:
             reply = (
@@ -801,7 +970,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ---------------- START BOT ----------------
+# ---------------- MAIN ----------------
 
 def main():
     app = Application.builder().token(TOKEN).build()
